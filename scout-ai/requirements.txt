@@ -1,0 +1,4 @@
+anthropic>=0.116.0
+pydantic>=2.7
+tavily-python>=0.5
+python-dotenv>=1.0

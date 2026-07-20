@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/scout.db
+outbox/
+logs/
+.env.*
