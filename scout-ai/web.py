@@ -275,6 +275,9 @@ main { flex: 1; overflow-y: auto; padding: 26px 30px; }
 }
 .stamp.dispatched { color: var(--signal-amber); transform: translate(-50%,-50%) rotate(-8deg); }
 .stamp.passed     { color: var(--passed-red);   transform: translate(-50%,-50%) rotate(6deg); }
+.stamp.small { font-size: 20px; border-width: 2px; opacity: .85; }
+/* on the tall detail page, anchor the stamp over the header, not mid-scroll */
+.detail > .stamp { top: 110px; left: 320px; }
 
 @keyframes stamp-in {
   0%   { opacity: 0; scale: 1.9; }
@@ -401,13 +404,21 @@ const esc = s => (s ?? "").toString()
   .replaceAll('"',"&quot;");
 
 function signalBar(label, value, cls="") {
-  const v = value == null ? null : Math.max(0, Math.min(100, value));
+  if (value == null) return "";  // no dead meters for unscored entries
+  const v = Math.max(0, Math.min(100, value));
   return `<div class="signal ${cls}">
     <span class="lbl">${label}</span>
-    <div class="track"><div class="fill" style="width:${v ?? 0}%"></div></div>
-    <span class="num">${v == null ? "—" : v + "%"}</span>
+    <div class="track"><div class="fill" style="width:${v}%"></div></div>
+    <span class="num">${v}%</span>
   </div>`;
 }
+
+function fundLine(...parts) {
+  return parts.filter(p => p != null && String(p).trim()).map(esc).join(" · ");
+}
+
+const STAMP_FOR = { APPROVED: ["DISPATCHED","dispatched"], SENT: ["DISPATCHED","dispatched"],
+                    REJECTED: ["PASSED","passed"] };
 
 function renderTabs() {
   $("#tabs").innerHTML = SIDEBAR.map(([key, label]) => `
@@ -419,19 +430,24 @@ function renderTabs() {
 }
 
 async function loadList() {
+  location.hash = "state=" + state;
   const res = await fetch(`/api/companies?state=${state}`);
   const data = await res.json();
   counts = data.counts;
   renderTabs();
   $("#foot").textContent = new Date().toISOString().slice(0,16).replace("T"," ") + " UTC";
   const label = SIDEBAR.find(([k]) => k===state)[1];
-  const cards = data.companies.map(c => `
+  const cards = data.companies.map(c => {
+    const st = STAMP_FOR[c.state];
+    return `
     <div class="card" data-id="${c.id}">
       <h3>${esc(c.name)}</h3>
-      <div class="fund">${esc(c.funding_stage ?? "?")} ${esc(c.funding_amount ?? "")} · #${c.id}</div>
+      <div class="fund">${fundLine((c.funding_stage ?? "?") + " " + (c.funding_amount ?? ""), "#" + c.id)}</div>
       <p class="line">${esc(c.one_liner)}</p>
       ${signalBar("match", c.match_score)}
-    </div>`).join("");
+      ${st ? `<div class="stamp small ${st[1]}">${st[0]}</div>` : ""}
+    </div>`;
+  }).join("");
   $("#main").innerHTML = `
     <div class="log-head">
       <h2>${label}</h2>
@@ -443,6 +459,7 @@ async function loadList() {
 }
 
 async function loadDetail(id) {
+  location.hash = "company=" + id;
   const c = await (await fetch(`/api/companies/${id}`)).json();
   const r = c.research ?? {};
   const m = c.match ?? {};
@@ -451,6 +468,7 @@ async function loadDetail(id) {
     `<span class="pill"><b>${esc(f.name)}</b>${f.role ? ` <span>· ${esc(f.role)}</span>` : ""}</span>`).join("");
   const signals = (r.hiring_signals ?? []).map(s => `<li>${esc(s)}</li>`).join("");
 
+  const terminal = STAMP_FOR[c.state];   // APPROVED/SENT/REJECTED: read-only
   const tray = o ? `
     <div class="tray">
       <h4>Dispatch Tray</h4>
@@ -473,12 +491,13 @@ async function loadDetail(id) {
         <label>Cover letter</label>
         <textarea id="f-cover">${esc(o.cover_letter)}</textarea>
       </div>
+      ${terminal ? `<div class="actions"><span class="note">read-only — already ${esc(c.state.toLowerCase())}</span></div>` : `
       <div class="actions">
         <button class="btn-approve" id="btn-approve">Approve &amp; Dispatch</button>
         <button class="btn-save" id="btn-save">Save Edits</button>
         <button class="btn-reject" id="btn-reject">Reject</button>
         <span class="note" id="action-note"></span>
-      </div>
+      </div>`}
     </div>` : "";
 
   $("#main").innerHTML = `
@@ -486,8 +505,8 @@ async function loadDetail(id) {
       <button class="back" id="back">&larr; back to log</button>
       <div class="detail-head">
         <h2>${esc(c.name)}</h2>
-        <div class="fund">${esc(c.funding_stage ?? "?")} ${esc(c.funding_amount ?? "")}
-          · ${esc(c.website ?? "")} · state ${esc(c.state)}</div>
+        <div class="fund">${fundLine((c.funding_stage ?? "?") + " " + (c.funding_amount ?? ""),
+          c.website, "state " + c.state)}</div>
         ${signalBar("match", c.match_score)}
         ${signalBar("hiring", c.hiring_probability)}
       </div>
@@ -496,10 +515,20 @@ async function loadDetail(id) {
       ${signals ? `<div class="sheet"><h4>Hiring Signals</h4><ul>${signals}</ul></div>` : ""}
       ${m.pitch_angle ? `<div class="sheet"><h4>Pitch Angle</h4><p>${esc(m.pitch_angle)}</p></div>` : ""}
       ${tray}
+      ${terminal ? `<div class="stamp ${terminal[1]}">${terminal[0]}</div>` : ""}
     </div>`;
 
   $("#back").addEventListener("click", loadList);
-  if (!o) return;
+  if (!o || terminal) {
+    // Read-only view: textareas stay visible but the tray tabs still switch.
+    document.querySelectorAll(".tray-tabs button").forEach(b =>
+      b.addEventListener("click", () => {
+        document.querySelectorAll(".tray-tabs button").forEach(x => x.classList.remove("active"));
+        b.classList.add("active");
+        ["email","linkedin","cover"].forEach(k => { const s = $("#slip-"+k); if (s) s.hidden = k !== b.dataset.slip; });
+      }));
+    return;
+  }
 
   document.querySelectorAll(".tray-tabs button").forEach(b =>
     b.addEventListener("click", () => {
@@ -556,7 +585,17 @@ async function loadDetail(id) {
   });
 }
 
-loadList();
+// Deep links: #state=DISCOVERED / #company=9 (also ?state= / ?company=)
+{
+  const q = new URLSearchParams(location.search);
+  const h = new URLSearchParams(location.hash.slice(1));
+  const get = k => h.get(k) ?? q.get(k);
+  if (get("company")) loadDetail(get("company"));
+  else {
+    if (get("state")) state = get("state");
+    loadList();
+  }
+}
 </script>
 </body>
 </html>

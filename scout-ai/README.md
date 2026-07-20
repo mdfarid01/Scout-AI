@@ -35,7 +35,10 @@ python pipeline.py            # full run: discover → research → match → dr
 python pipeline.py --stage discover   # or run one stage at a time
 python review.py              # review queue: approve / edit / reject drafts
 python review.py --mark-sent 3        # after you sent company #3's email
+python web.py                 # field-log dashboard at http://localhost:8000
 ```
+
+The dashboard supports deep links: `/?state=DISCOVERED`, `/?company=13`.
 
 Approved drafts land in `outbox/<company>/` as `email.txt`, `linkedin.txt`,
 `cover_letter.txt`, and `resume_ordering.txt` — you send them yourself
