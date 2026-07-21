@@ -19,3 +19,12 @@ INFO:     127.0.0.1:59455 - "GET /api/companies?state=SENT HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59455 - "GET /api/companies/13 HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59457 - "GET /api/companies?state=APPROVED HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59457 - "GET /api/companies/6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59512 - "GET /api/companies?state=WAITING_APPROVAL HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59512 - "GET /api/companies?state=APPROVED HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59512 - "GET /api/companies?state=MATCHED HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59512 - "GET /api/companies?state=RESEARCHED HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59512 - "GET /api/companies?state=DISCOVERED HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59512 - "GET /api/companies?state=SKIPPED HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59512 - "GET /api/profile HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59517 - "GET /api/companies?state=WAITING_APPROVAL HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59519 - "GET /api/profile HTTP/1.1" 200 OK
