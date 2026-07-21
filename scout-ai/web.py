@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 # Scout AI review dashboard — FastAPI, single inline page, no build step.
 # Reuses db.py for all persistence and review.py's export for approvals.
+import io
 import json
+import threading
+import uuid
+from contextlib import redirect_stderr, redirect_stdout
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
+import agents
 import db
+import pipeline
 import review
+from config import PROFILE_DIR
 from models import OutreachDrafts
 
 app = FastAPI(title="Scout AI")
@@ -18,6 +25,7 @@ STATES = ["WAITING_APPROVAL", "MATCHED", "RESEARCHED", "DISCOVERED", "SKIPPED", 
 
 SIDEBAR_STATES = [
     ("WAITING_APPROVAL", "Waiting Approval"),
+    ("APPROVED", "Approved"),
     ("MATCHED", "Matched"),
     ("RESEARCHED", "Researched"),
     ("DISCOVERED", "Discovered"),
@@ -96,6 +104,19 @@ def reject(company_id: int):
     return {"ok": True}
 
 
+@app.post("/api/companies/{company_id}/mark-sent")
+def mark_sent(company_id: int):
+    # Same transition review.py performs with --mark-sent <id>.
+    with db.get_db() as conn:
+        row = db.get_company(conn, company_id)
+        if row is None:
+            raise HTTPException(404, "not found")
+        if row["state"] != "APPROVED":
+            raise HTTPException(409, f"cannot mark sent from state {row['state']}")
+        db.set_stage(conn, company_id, "SENT", note="sent manually")
+    return {"ok": True}
+
+
 class EditPayload(BaseModel):
     email_subject: str | None = None
     email_body: str | None = None
@@ -115,6 +136,103 @@ def edit(company_id: int, payload: EditPayload):
         db.set_stage(conn, company_id, row["state"], "outreach_json",
                      drafts.model_dump(), note="edited via dashboard")
     return {"ok": True}
+
+
+# ── Profile ───────────────────────────────────────────────────────────────
+class ProfilePayload(BaseModel):
+    resume: str = ""
+    preferences: str = ""
+
+
+def _read_profile_file(name: str) -> str:
+    path = PROFILE_DIR / name
+    return path.read_text() if path.exists() else ""
+
+
+@app.get("/api/profile")
+def get_profile():
+    return {"resume": _read_profile_file("resume.md"),
+            "preferences": _read_profile_file("preferences.md")}
+
+
+@app.post("/api/profile")
+def save_profile(payload: ProfilePayload):
+    PROFILE_DIR.mkdir(exist_ok=True)
+    (PROFILE_DIR / "resume.md").write_text(payload.resume)
+    (PROFILE_DIR / "preferences.md").write_text(payload.preferences)
+    return {"ok": True}
+
+
+# ── Pipeline runs (background thread + captured print output) ─────────────
+RUNS: dict[str, dict] = {}
+RUN_LOCK = threading.Lock()
+
+
+class _LineWriter(io.TextIOBase):
+    """File-like sink that appends completed lines to a run's log list."""
+
+    def __init__(self, lines: list[str]):
+        self.lines = lines
+        self._buf = ""
+
+    def write(self, s: str) -> int:
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                self.lines.append(line)
+        return len(s)
+
+
+class RunPayload(BaseModel):
+    max_research: int = 10
+    min_score: int = 60
+
+
+def _run_pipeline(run_id: str, max_research: int, min_score: int):
+    run = RUNS[run_id]
+    writer = _LineWriter(run["lines"])
+    try:
+        # The pipeline stage functions read these module globals at call
+        # time, so overriding them here applies the UI-chosen limits
+        # without touching pipeline.py.
+        pipeline.MAX_RESEARCH_PER_RUN = max_research
+        pipeline.MIN_MATCH_SCORE = min_score
+        with redirect_stdout(writer), redirect_stderr(writer):
+            with db.get_db() as conn:
+                pipeline.run_discovery(conn)
+                pipeline.run_research(conn)
+                profile = agents.load_profile()
+                pipeline.run_matching(conn, profile)
+                pipeline.run_outreach(conn, profile)
+        run["lines"].append("— run complete")
+        run["status"] = "done"
+    except BaseException as e:  # SystemExit (missing profile) included
+        run["lines"].append(f"! run failed: {type(e).__name__}: {e}")
+        run["status"] = "error"
+
+
+@app.post("/api/run")
+def start_run(payload: RunPayload):
+    with RUN_LOCK:
+        if any(r["status"] == "running" for r in RUNS.values()):
+            raise HTTPException(409, "a run is already in progress")
+        run_id = uuid.uuid4().hex[:8]
+        RUNS[run_id] = {"status": "running", "lines": []}
+    threading.Thread(
+        target=_run_pipeline,
+        args=(run_id, max(1, payload.max_research), max(0, payload.min_score)),
+        daemon=True,
+    ).start()
+    return {"run_id": run_id}
+
+
+@app.get("/api/run/{run_id}/status")
+def run_status(run_id: str):
+    run = RUNS.get(run_id)
+    if run is None:
+        raise HTTPException(404, "unknown run")
+    return {"status": run["status"], "lines": run["lines"]}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -292,6 +410,61 @@ main { flex: 1; overflow-y: auto; padding: 26px 30px; }
   .card.thump, .detail.thump { animation: none; }
 }
 
+/* ── Run bar & dispatch log ──────────────────────────── */
+#runbar { margin-bottom: 22px; }
+.run-controls {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(122,155,110,.25);
+}
+.run-title {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10.5px; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--trail-moss);
+}
+.run-controls label {
+  font-family: "IBM Plex Mono", monospace; font-size: 11px;
+  color: var(--paper); opacity: .8;
+  display: flex; align-items: center; gap: 7px;
+}
+.run-controls input[type=number] {
+  width: 58px; background: transparent;
+  border: 1px solid var(--trail-moss);
+  color: var(--signal-amber);
+  font-family: "IBM Plex Mono", monospace; font-size: 13px;
+  padding: 4px 6px; text-align: right;
+}
+.run-controls input[type=number]:focus { outline: 1px solid var(--signal-amber); }
+#btn-run {
+  font-family: "IBM Plex Mono", monospace; font-size: 12px;
+  letter-spacing: .08em; text-transform: uppercase; font-weight: 500;
+  background: var(--signal-amber); color: var(--bg-pine);
+  border: none; padding: 8px 20px; cursor: pointer;
+}
+#btn-run:hover { filter: brightness(1.08); }
+#btn-run:disabled { opacity: .45; cursor: default; filter: none; }
+#runlog { margin-top: 16px; max-width: 860px; }
+#runlog h4 {
+  font-family: "IBM Plex Mono", monospace; font-size: 10.5px;
+  letter-spacing: .14em; text-transform: uppercase;
+  color: var(--trail-moss); margin-bottom: 8px;
+}
+#runlog pre {
+  background: var(--paper); color: var(--ink);
+  font-family: "IBM Plex Mono", monospace; font-size: 12px; line-height: 1.7;
+  padding: 14px 16px; margin: 0;
+  border-left: 4px solid var(--signal-amber);
+  box-shadow: 3px 4px 0 rgba(0,0,0,.3);
+  max-height: 240px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-word;
+}
+
+/* ── Profile view ────────────────────────────────────── */
+.nav-div { border-top: 1px solid rgba(122,155,110,.25); margin: 10px 0; }
+.profile-slips { max-width: 860px; }
+.profile-slips .slip { margin-bottom: 22px; }
+.profile-slips textarea { min-height: 260px; }
+
 /* ── Detail view ─────────────────────────────────────── */
 .detail { max-width: 860px; position: relative; }
 .back {
@@ -387,15 +560,31 @@ main { flex: 1; overflow-y: auto; padding: 26px 30px; }
   <div id="tabs"></div>
   <div class="foot" id="foot">—</div>
 </nav>
-<main id="main"></main>
+<main>
+  <div id="runbar">
+    <div class="run-controls">
+      <span class="run-title">Expedition</span>
+      <label>max research <input id="run-max" type="number" value="10" min="1" max="50"></label>
+      <label>min match <input id="run-min" type="number" value="60" min="0" max="100"></label>
+      <button id="btn-run">Run Scout</button>
+      <span class="note" id="run-note"></span>
+    </div>
+    <div id="runlog" hidden>
+      <h4>Dispatch Log</h4>
+      <pre id="runlog-lines"></pre>
+    </div>
+  </div>
+  <div id="content"></div>
+</main>
 
 <script>
 const SIDEBAR = [
-  ["WAITING_APPROVAL","Waiting Approval"], ["MATCHED","Matched"],
-  ["RESEARCHED","Researched"], ["DISCOVERED","Discovered"],
-  ["SKIPPED","Skipped"], ["SENT","Sent"],
+  ["WAITING_APPROVAL","Waiting Approval"], ["APPROVED","Approved"],
+  ["MATCHED","Matched"], ["RESEARCHED","Researched"],
+  ["DISCOVERED","Discovered"], ["SKIPPED","Skipped"], ["SENT","Sent"],
 ];
 let state = "WAITING_APPROVAL";
+let view = "list";     // "list" | "detail" | "profile"
 let counts = {};
 
 const $ = (sel, el=document) => el.querySelector(sel);
@@ -422,14 +611,20 @@ const STAMP_FOR = { APPROVED: ["DISPATCHED","dispatched"], SENT: ["DISPATCHED","
 
 function renderTabs() {
   $("#tabs").innerHTML = SIDEBAR.map(([key, label]) => `
-    <button class="tab ${key===state?"active":""}" data-state="${key}">
+    <button class="tab ${view!=="profile" && key===state ? "active" : ""}" data-state="${key}">
       <span>${label}</span><span class="count">${counts[key] ?? 0}</span>
-    </button>`).join("");
-  document.querySelectorAll("#tabs .tab").forEach(b =>
+    </button>`).join("") + `
+    <div class="nav-div"></div>
+    <button class="tab ${view==="profile" ? "active" : ""}" data-view="profile">
+      <span>Profile &amp; Prefs</span>
+    </button>`;
+  document.querySelectorAll("#tabs .tab[data-state]").forEach(b =>
     b.addEventListener("click", () => { state = b.dataset.state; loadList(); }));
+  $("#tabs .tab[data-view=profile]").addEventListener("click", loadProfile);
 }
 
 async function loadList() {
+  view = "list";
   location.hash = "state=" + state;
   const res = await fetch(`/api/companies?state=${state}`);
   const data = await res.json();
@@ -448,7 +643,7 @@ async function loadList() {
       ${st ? `<div class="stamp small ${st[1]}">${st[0]}</div>` : ""}
     </div>`;
   }).join("");
-  $("#main").innerHTML = `
+  $("#content").innerHTML = `
     <div class="log-head">
       <h2>${label}</h2>
       <span class="meta">${data.companies.length} entries</span>
@@ -491,7 +686,10 @@ async function loadDetail(id) {
         <label>Cover letter</label>
         <textarea id="f-cover">${esc(o.cover_letter)}</textarea>
       </div>
-      ${terminal ? `<div class="actions"><span class="note">read-only — already ${esc(c.state.toLowerCase())}</span></div>` : `
+      ${terminal ? `<div class="actions">
+        ${c.state === "APPROVED" ? `<button class="btn-approve" id="btn-mark-sent">Mark as Sent</button>` : ""}
+        <span class="note" id="action-note">read-only — already ${esc(c.state.toLowerCase())}${c.state === "APPROVED" ? " · drafts exported to outbox/" : ""}</span>
+      </div>` : `
       <div class="actions">
         <button class="btn-approve" id="btn-approve">Approve &amp; Dispatch</button>
         <button class="btn-save" id="btn-save">Save Edits</button>
@@ -500,7 +698,7 @@ async function loadDetail(id) {
       </div>`}
     </div>` : "";
 
-  $("#main").innerHTML = `
+  $("#content").innerHTML = `
     <div class="detail" id="detail">
       <button class="back" id="back">&larr; back to log</button>
       <div class="detail-head">
@@ -527,6 +725,13 @@ async function loadDetail(id) {
         b.classList.add("active");
         ["email","linkedin","cover"].forEach(k => { const s = $("#slip-"+k); if (s) s.hidden = k !== b.dataset.slip; });
       }));
+    const ms = $("#btn-mark-sent");
+    if (ms) ms.addEventListener("click", async () => {
+      const res = await fetch(`/api/companies/${id}/mark-sent`, {method: "POST"});
+      if (!res.ok) { $("#action-note").textContent = "mark-sent failed"; return; }
+      $("#action-note").textContent = "marked as sent";
+      setTimeout(() => { state = "SENT"; loadList(); }, 500);
+    });
     return;
   }
 
@@ -585,12 +790,94 @@ async function loadDetail(id) {
   });
 }
 
-// Deep links: #state=DISCOVERED / #company=9 (also ?state= / ?company=)
+// ── Profile view ─────────────────────────────────────────
+async function loadProfile() {
+  view = "profile";
+  location.hash = "view=profile";
+  const p = await (await fetch("/api/profile")).json();
+  renderTabs();
+  $("#content").innerHTML = `
+    <div class="log-head"><h2>Profile &amp; Preferences</h2>
+      <span class="meta">feeds matching &amp; outreach</span></div>
+    <div class="profile-slips">
+      <div class="slip r1">
+        <label>Resume — profile/resume.md</label>
+        <textarea id="p-resume" placeholder="# Your Name&#10;&#10;Experience, projects, skills — markdown or plain text.">${esc(p.resume)}</textarea>
+      </div>
+      <div class="slip r2">
+        <label>Preferences — profile/preferences.md</label>
+        <textarea id="p-prefs" placeholder="## What I'm looking for&#10;- Role: ...&#10;- Stack: ...&#10;- Location: ...">${esc(p.preferences)}</textarea>
+      </div>
+      <div class="actions">
+        <button class="btn-approve" id="btn-profile-save">Save Profile</button>
+        <span class="note" id="profile-note"></span>
+      </div>
+    </div>`;
+  $("#btn-profile-save").addEventListener("click", async () => {
+    const res = await fetch("/api/profile", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({resume: $("#p-resume").value, preferences: $("#p-prefs").value}),
+    });
+    $("#profile-note").textContent =
+      res.ok ? "saved " + new Date().toLocaleTimeString() : "save failed";
+  });
+}
+
+// ── Run control ──────────────────────────────────────────
+let activeRun = null;
+
+async function startRun() {
+  const body = {max_research: +$("#run-max").value || 10,
+                min_score: +$("#run-min").value || 60};
+  const res = await fetch("/api/run", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    $("#run-note").textContent = res.status === 409
+      ? "a run is already in progress" : "failed to start run";
+    return;
+  }
+  activeRun = (await res.json()).run_id;
+  $("#btn-run").disabled = true;
+  $("#run-note").textContent = "run " + activeRun + " underway";
+  $("#runlog").hidden = false;
+  $("#runlog-lines").textContent = "";
+  pollRun();
+}
+
+async function pollRun() {
+  if (!activeRun) return;
+  let d;
+  try {
+    d = await (await fetch(`/api/run/${activeRun}/status`)).json();
+  } catch { setTimeout(pollRun, 2000); return; }
+  const pre = $("#runlog-lines");
+  pre.textContent = d.lines.join("\n");
+  pre.scrollTop = pre.scrollHeight;
+  if (d.status === "running") { setTimeout(pollRun, 2000); return; }
+  $("#run-note").textContent = "run " + activeRun + " " + d.status;
+  $("#btn-run").disabled = false;
+  activeRun = null;
+  if (view === "list") loadList(); else renderTabsRefresh();
+}
+
+async function renderTabsRefresh() {
+  // refresh sidebar counts without leaving the current view
+  const d = await (await fetch("/api/companies?state=WAITING_APPROVAL")).json();
+  counts = d.counts;
+  renderTabs();
+}
+
+$("#btn-run").addEventListener("click", startRun);
+
+// Deep links: #state=DISCOVERED / #company=9 / #view=profile (also ?…)
 {
   const q = new URLSearchParams(location.search);
   const h = new URLSearchParams(location.hash.slice(1));
   const get = k => h.get(k) ?? q.get(k);
-  if (get("company")) loadDetail(get("company"));
+  if (get("view") === "profile") { renderTabsRefresh().then(loadProfile); }
+  else if (get("company")) loadDetail(get("company"));
   else {
     if (get("state")) state = get("state");
     loadList();
