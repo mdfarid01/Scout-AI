@@ -10,3 +10,12 @@ INFO:     127.0.0.1:59256 - "GET /favicon.ico HTTP/1.1" 404 Not Found
 INFO:     127.0.0.1:59276 - "GET /?company=13 HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59276 - "GET /api/companies/13 HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59276 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:59454 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59454 - "GET /api/companies?state=RESEARCHED HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59454 - "GET /api/companies?state=APPROVED HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59454 - "GET /api/companies/13 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59455 - "POST /api/companies/13/mark-sent HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59455 - "GET /api/companies?state=SENT HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59455 - "GET /api/companies/13 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59457 - "GET /api/companies?state=APPROVED HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59457 - "GET /api/companies/6 HTTP/1.1" 200 OK
